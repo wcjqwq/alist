@@ -34,7 +34,8 @@ func Init(e *gin.Engine) {
 	}
 	WebDav(g.Group("/dav"))
 
-	g.GET("/d/*path", middlewares.Down, handles.Down)
+	g.GET("/client_design_data/*path", middlewares.Down, handles.Down)
+	g.GET("/client_game_res/*path", middlewares.Down, handles.Down)
 	g.GET("/p/*path", middlewares.Down, handles.Proxy)
 
 	api := g.Group("/api")
