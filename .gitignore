@@ -25,8 +25,11 @@ out/
 *.json
 /build
 /data/
+/tmp/
 /log/
 /lang/
 /daemon/
 /public/dist/*
 /!public/dist/README.md
+
+.VSCodeCounter

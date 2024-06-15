@@ -7,8 +7,11 @@ import (
 
 type Addition struct {
 	driver.RootID
-	Username string `json:"username" required:"true"`
-	Password string `json:"password" required:"true"`
+	Username         string `json:"username" required:"true"`
+	Password         string `json:"password" required:"true"`
+	ClientID         string `json:"client_id" required:"true" default:"YNxT9w7GMdWvEOKa"`
+	ClientSecret     string `json:"client_secret" required:"true" default:"dbw2OtmVEeuUvIptb1Coyg"`
+	DisableMediaLink bool   `json:"disable_media_link"`
 }
 
 var config = driver.Config{

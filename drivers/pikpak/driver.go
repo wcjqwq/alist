@@ -2,32 +2,29 @@ package pikpak
 
 import (
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/pkg/utils"
+	hash_extend "github.com/alist-org/alist/v3/pkg/utils/hash"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/go-resty/resty/v2"
-	jsoniter "github.com/json-iterator/go"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/oauth2"
 )
 
 type PikPak struct {
 	model.Storage
 	Addition
-	RefreshToken string
-	AccessToken  string
+
+	oauth2Token oauth2.TokenSource
 }
 
 func (d *PikPak) Config() driver.Config {
@@ -38,8 +35,30 @@ func (d *PikPak) GetAddition() driver.Additional {
 	return &d.Addition
 }
 
-func (d *PikPak) Init(ctx context.Context) error {
-	return d.login()
+func (d *PikPak) Init(ctx context.Context) (err error) {
+	if d.ClientID == "" || d.ClientSecret == "" {
+		d.ClientID = "YNxT9w7GMdWvEOKa"
+		d.ClientSecret = "dbw2OtmVEeuUvIptb1Coyg"
+	}
+
+	oauth2Config := &oauth2.Config{
+		ClientID:     d.ClientID,
+		ClientSecret: d.ClientSecret,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:   "https://user.mypikpak.com/v1/auth/signin",
+			TokenURL:  "https://user.mypikpak.com/v1/auth/token",
+			AuthStyle: oauth2.AuthStyleInParams,
+		},
+	}
+
+	d.oauth2Token = oauth2.ReuseTokenSource(nil, utils.TokenSource(func() (*oauth2.Token, error) {
+		return oauth2Config.PasswordCredentialsToken(
+			context.WithValue(context.Background(), oauth2.HTTPClient, base.HttpClient),
+			d.Username,
+			d.Password,
+		)
+	}))
+	return nil
 }
 
 func (d *PikPak) Drop(ctx context.Context) error {
@@ -66,7 +85,7 @@ func (d *PikPak) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 	link := model.Link{
 		URL: resp.WebContentLink,
 	}
-	if len(resp.Medias) > 0 && resp.Medias[0].Link.Url != "" {
+	if !d.DisableMediaLink && len(resp.Medias) > 0 && resp.Medias[0].Link.Url != "" {
 		log.Debugln("use media link")
 		link.URL = resp.Medias[0].Link.Url
 	}
@@ -127,55 +146,47 @@ func (d *PikPak) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *PikPak) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
-	tempFile, err := utils.CreateTempFile(stream.GetReadCloser())
-	if err != nil {
-		return err
+	hi := stream.GetHash()
+	sha1Str := hi.GetHash(hash_extend.GCID)
+	if len(sha1Str) < hash_extend.GCID.Width {
+		tFile, err := stream.CacheFullInTempFile()
+		if err != nil {
+			return err
+		}
+
+		sha1Str, err = utils.HashFile(hash_extend.GCID, tFile, stream.GetSize())
+		if err != nil {
+			return err
+		}
 	}
-	defer func() {
-		_ = tempFile.Close()
-		_ = os.Remove(tempFile.Name())
-	}()
-	// cal sha1
-	s := sha1.New()
-	_, err = io.Copy(s, tempFile)
-	if err != nil {
-		return err
-	}
-	_, err = tempFile.Seek(0, io.SeekStart)
-	if err != nil {
-		return err
-	}
-	sha1Str := hex.EncodeToString(s.Sum(nil))
-	data := base.Json{
-		"kind":        "drive#file",
-		"name":        stream.GetName(),
-		"size":        stream.GetSize(),
-		"hash":        strings.ToUpper(sha1Str),
-		"upload_type": "UPLOAD_TYPE_RESUMABLE",
-		"objProvider": base.Json{"provider": "UPLOAD_TYPE_UNKNOWN"},
-		"parent_id":   dstDir.GetID(),
-	}
+
+	var resp UploadTaskData
 	res, err := d.request("https://api-drive.mypikpak.com/drive/v1/files", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(data)
-	}, nil)
+		req.SetBody(base.Json{
+			"kind":        "drive#file",
+			"name":        stream.GetName(),
+			"size":        stream.GetSize(),
+			"hash":        strings.ToUpper(sha1Str),
+			"upload_type": "UPLOAD_TYPE_RESUMABLE",
+			"objProvider": base.Json{"provider": "UPLOAD_TYPE_UNKNOWN"},
+			"parent_id":   dstDir.GetID(),
+			"folder_type": "NORMAL",
+		})
+	}, &resp)
 	if err != nil {
 		return err
 	}
-	if stream.GetSize() == 0 {
+
+	// 秒传成功
+	if resp.Resumable == nil {
 		log.Debugln(string(res))
 		return nil
 	}
-	params := jsoniter.Get(res, "resumable").Get("params")
-	endpoint := params.Get("endpoint").ToString()
-	endpointS := strings.Split(endpoint, ".")
-	endpoint = strings.Join(endpointS[1:], ".")
-	accessKeyId := params.Get("access_key_id").ToString()
-	accessKeySecret := params.Get("access_key_secret").ToString()
-	securityToken := params.Get("security_token").ToString()
-	key := params.Get("key").ToString()
-	bucket := params.Get("bucket").ToString()
+
+	params := resp.Resumable.Params
+	endpoint := strings.Join(strings.Split(params.Endpoint, ".")[1:], ".")
 	cfg := &aws.Config{
-		Credentials: credentials.NewStaticCredentials(accessKeyId, accessKeySecret, securityToken),
+		Credentials: credentials.NewStaticCredentials(params.AccessKeyID, params.AccessKeySecret, params.SecurityToken),
 		Region:      aws.String("pikpak"),
 		Endpoint:    &endpoint,
 	}
@@ -184,10 +195,13 @@ func (d *PikPak) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 		return err
 	}
 	uploader := s3manager.NewUploader(ss)
+	if stream.GetSize() > s3manager.MaxUploadParts*s3manager.DefaultUploadPartSize {
+		uploader.PartSize = stream.GetSize() / (s3manager.MaxUploadParts - 1)
+	}
 	input := &s3manager.UploadInput{
-		Bucket: &bucket,
-		Key:    &key,
-		Body:   tempFile,
+		Bucket: &params.Bucket,
+		Key:    &params.Key,
+		Body:   stream,
 	}
 	_, err = uploader.UploadWithContext(ctx, input)
 	return err
